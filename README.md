@@ -621,48 +621,50 @@ curl -s $BASE/api/v1/transactions/account/$ALICE_ID \
            └─────┬─────┘
                  │
            ┌─────▼──────┐
-           │ PROCESSING  │  ← Saga started; Redis locks held on both accounts
+           │ PROCESSING  │  ← Saga started; locks held; atomic debit+credit in progress
            └─────┬───────┘
-          ┌──────┴──────┐
-          │             │
-   ┌──────▼──────┐  ┌───▼──────────┐
-   │  COMPLETED  │  │    FAILED    │  ← Debit never happened; accounts untouched
-   └─────────────┘  └──────────────┘
-                          │  Debit succeeded but credit failed
-                    ┌─────▼──────────┐
-                    │  COMPENSATING  │  ← Reversing the source debit
-                    └─────┬──────────┘
-                 ┌────────┴───────────────┐
-                 │                        │
-          ┌──────▼──────┐   ┌─────────────▼──────────────┐
-          │ COMPENSATED  │   │    NEEDS_MANUAL_REVIEW      │
-          └─────────────┘   │  (compensation also failed, │
-                            │   or status record write    │
-                            │   failed after both accounts│
-                            │   were successfully updated)│
-                            └────────────────────────────-┘
+          ┌──────┴───────────────────┐
+          │                          │
+   ┌──────▼──────┐           ┌───────▼──────┐
+   │  COMPLETED  │           │    FAILED    │  ← Business rule violated (e.g. insufficient
+   └─────────────┘           └──────────────┘    funds, frozen account); DB rolled back —
+                                                  no money moved
+                                    │  Status save failed after atomic commit
+                             ┌──────▼────────────────────┐
+                             │    NEEDS_MANUAL_REVIEW     │  ← Balances are correct in DB;
+                             └───────────────────────────-┘    only the status record failed
 ```
 
 ---
 
-## Saga Pattern & Compensation
+## Saga Pattern
 
-The transfer is orchestrated by `TransferSagaOrchestrator` using an **explicit failure-scenario matrix** rather than a single flag:
+The transfer is orchestrated by `TransferSagaOrchestrator` in three phases:
 
 ```
-Step 1: source.debit()  → accountRepository.save(source)  → debitSucceeded = true
-Step 2: target.credit() → accountRepository.save(target)  → creditSucceeded = true
-Step 3: transaction.markCompleted() → transactionRepository.save(transaction)
+Phase 1 — Mark PROCESSING (own DB transaction, commits immediately)
+          Crash-recovery signal: a recovery job can detect rows stuck here.
+
+Phase 2 — Atomic debit + credit (Spring TransactionTemplate — single DB transaction)
+          source.debit(amount)   → accountRepository.save(source)
+          target.credit(amount)  → accountRepository.save(target)
+          If anything throws, the DB rolls back both saves automatically.
+          No application-level compensation is needed.
+
+Phase 3 — Mark COMPLETED
+          If this save fails, the balances in the DB are already correct.
+          Do NOT compensate — mark NEEDS_MANUAL_REVIEW instead.
 ```
 
-| `debitSucceeded` | `creditSucceeded` | Failure point | Action |
-|:---:|:---:|---|---|
-| `false` | `false` | Debit rejected (e.g. insufficient funds) | Mark `FAILED` — no money moved |
-| `true` | `false` | Credit rejected (e.g. target account frozen) | Reverse debit on source → `COMPENSATED` |
-| `true` | `true` | Status record write failed | **Do not touch accounts** — they are correct. Mark `NEEDS_MANUAL_REVIEW` |
-| `false` | `true` | Impossible — guarded with ERROR log | Mark `NEEDS_MANUAL_REVIEW` |
+### Failure scenarios
 
-The key insight of Scenario C: when both account updates have already been committed to the database, attempting to compensate would reverse a transfer that succeeded. The `creditSucceeded` flag prevents this error class entirely.
+| Failure point | Cause | Outcome |
+|---|---|---|
+| Phase 2 — `DomainException` | Business rule violated (insufficient funds, frozen account) | DB rolls back both saves. Mark `FAILED` — no money moved. |
+| Phase 2 — other exception | Transient infrastructure error (DB timeout, network) | Exception propagates; `@Retry` on `TransferMoneyService` re-attempts. |
+| Phase 3 — status save fails | DB write failure after atomic commit | Balances are correct. Mark `NEEDS_MANUAL_REVIEW` — do not compensate. |
+
+**Why no application-level compensation?** The old approach ran debit and credit as two separate DB transactions, leaving a window where money was in transit. Wrapping both in a single `TransactionTemplate` means either both commit or neither does — the database rollback replaces the need for a compensating transaction entirely. Scenario C (status save fails) is the only remaining case requiring manual attention.
 
 ---
 
@@ -695,8 +697,8 @@ Hibernate appends `AND version = ?` to every `UPDATE accounts`. If another trans
 
 Two-layer deduplication:
 
-1. **Application layer**: `findByIdempotencyKey()` before acquiring any locks — returns the existing transaction if found.
-2. **Database layer**: `UNIQUE` constraint on `idempotency_key` — the last-resort guard if two identical requests both pass the application check simultaneously. `JpaTransactionRepositoryAdapter` catches the resulting `DataIntegrityViolationException` and returns the existing record.
+1. **Application layer**: `findByIdempotencyKey()` before acquiring any locks. Only **terminal** transactions (`COMPLETED`, `FAILED`, `COMPENSATED`, `NEEDS_MANUAL_REVIEW`) return early. A `PENDING` or `PROCESSING` transaction falls through so `@Retry` can re-run the saga — necessary because the previous attempt may have been interrupted.
+2. **Database layer**: `UNIQUE` constraint on `idempotency_key` — last-resort guard if two identical requests both pass step 1 before either saves. `JpaTransactionRepositoryAdapter` catches the resulting `DataIntegrityViolationException` and returns the existing record.
 3. **Inside the lock**: after acquiring the Redis lock, the transaction status is re-read. If it is already terminal (set by a concurrent duplicate that finished first), the saga is skipped entirely.
 
 ---
@@ -712,18 +714,22 @@ banking.events  (Topic Exchange — durable)
 ├── transfer.completed  →  banking.transfer.completed    (durable)
 ├── transfer.failed     →  banking.transfer.failed       (durable)
 └── dead-letter         →  banking.dead-letter           (durable — poison message sink)
+
+Note: the `account.debited` routing key is no longer used for debit reversals. With the atomic
+`TransactionTemplate`, a failed credit causes a DB rollback rather than a compensating credit event.
 ```
 
 ### Domain Events Published Per Transfer
 
 | Event | Trigger | Routing Key |
 |---|---|---|
-| `TransferInitiatedEvent` | Saga begins | `transfer.initiated` |
-| `AccountDebitedEvent` | Source account balance reduced | `account.debited` |
-| `AccountCreditedEvent` | Target account balance increased | `account.credited` |
-| `TransferCompletedEvent` | Both accounts updated, status COMPLETED | `transfer.completed` |
+| `TransferInitiatedEvent` | Saga Phase 1 — PROCESSING recorded | `transfer.initiated` |
+| `AccountDebitedEvent` | Phase 2 atomic commit succeeded — source debited | `account.debited` |
+| `AccountCreditedEvent` | Phase 2 atomic commit succeeded — target credited | `account.credited` |
+| `TransferCompletedEvent` | Phase 3 — status COMPLETED saved | `transfer.completed` |
 | `TransferFailedEvent` | Any terminal failure path | `transfer.failed` |
-| `DebitReversedEvent` | Compensation: debit successfully reversed | `account.debited` |
+
+> Note: `DebitReversedEvent` has been removed. The previous application-level compensation (debit reversal) is no longer needed because debit and credit are now wrapped in a single `TransactionTemplate` — the DB rolls back both atomically on failure.
 
 > **Important**: Event publishing is currently fire-and-forget. The transaction commits before events are published. For guaranteed at-least-once delivery in production, implement the **Transactional Outbox Pattern**.
 
@@ -918,7 +924,7 @@ Test coverage by layer:
 | **Multi-currency** | Transfers require matching currencies | Add FX rate service and currency conversion |
 | **Pagination** | Account history returns all transactions unbounded | Implement cursor-based pagination |
 | **Rate limiting** | No throttling at the application layer | Add token-bucket rate limiting at the API gateway |
-| **Saga durability** | Saga state is in-memory; JVM crash loses progress | Persist saga state to DB for crash recovery |
+| **Saga crash recovery** | PROCESSING rows left by a crashed JVM are never retried | Add a scheduled job to detect and re-drive stuck PROCESSING transactions |
 | **Event ordering** | No guaranteed ordering across partitions | Use Kafka with partition key = account ID if ordering is critical |
 
 ---
