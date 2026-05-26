@@ -14,13 +14,7 @@
 
 A production-grade banking backend built with **Hexagonal (Ports & Adapters) Architecture**. The system provides REST APIs for account management and fund transfers, with strong consistency guarantees, fault tolerance, and full observability.
 
-The implementation addresses the following engineering challenges found in real financial systems:
-
-- **Double-spend prevention** via two independent concurrency guards (distributed lock + optimistic locking)
-- **Idempotent transfers** at both the application layer and the database constraint layer
-- **Saga-based compensation** with explicit failure-scenario branching to avoid corrupting account balances
-- **Event-driven audit trail** published to RabbitMQ after each stage of a transfer
-- **Zero downtime schema management** via Flyway migrations
+The implementation identifies and solves six real-world engineering challenges that cause silent data corruption or system failure in production banking systems. See [Engineering Challenges Solved](#engineering-challenges-solved) for the full breakdown.
 
 ---
 
@@ -43,6 +37,7 @@ The implementation addresses the following engineering challenges found in real 
 15. [Scalability](#scalability)
 16. [Running Tests](#running-tests)
 17. [Known Limitations & Production Considerations](#known-limitations--production-considerations)
+18. [Engineering Challenges Solved](#engineering-challenges-solved)
 
 ---
 
@@ -926,6 +921,182 @@ Test coverage by layer:
 | **Rate limiting** | No throttling at the application layer | Add token-bucket rate limiting at the API gateway |
 | **Saga crash recovery** | PROCESSING rows left by a crashed JVM are never retried | Add a scheduled job to detect and re-drive stuck PROCESSING transactions |
 | **Event ordering** | No guaranteed ordering across partitions | Use Kafka with partition key = account ID if ordering is critical |
+
+---
+
+## Engineering Challenges Solved
+
+This section documents six concrete problems that cause silent data corruption or hard-to-reproduce failures in real banking systems, and exactly how each one is addressed here.
+
+---
+
+### Challenge 1 — Stale Account Reads Inside the Lock
+
+**The problem**
+
+A naive implementation loads account balances before acquiring the distributed lock, then uses those balances inside the lock to run the saga:
+
+```
+1. source = accountRepository.findById(...)   ← read happens HERE
+2. target = accountRepository.findById(...)   ← read happens HERE
+3. distributedLock.executeWithLocks(...)
+4.   source.debit(amount)                     ← uses stale data
+5.   accountRepository.save(source)           ← writes a stale version
+```
+
+Between steps 2 and 3, another transfer can acquire the lock, debit the same source account, and commit. The first request then overwrites that commit with its stale read — effectively reversing the concurrent transfer and creating money from nothing.
+
+**The fix**
+
+Accounts are loaded **inside** the lock, after any competing transfer has already committed:
+
+```java
+distributedLock.executeWithLocks(lockOrder, () -> {
+    // Any prior holder of these locks has committed by the time we get here.
+    Account source = accountRepository.findById(command.fromAccountId()).orElseThrow();
+    Account target = accountRepository.findById(command.toAccountId()).orElseThrow();
+    sagaOrchestrator.execute(current, source, target, command.amount());
+});
+```
+
+**Files**: `TransferMoneyService.java`
+
+---
+
+### Challenge 2 — `@Retry` Breaks Idempotency
+
+**The problem**
+
+`@Retry` re-enters the entire method on a transient failure. If the idempotency check returns early for **any** existing transaction, then a retry that finds a `PENDING` or `PROCESSING` record returns that stale state immediately — the saga never runs again, and the transfer is permanently stuck.
+
+```
+Attempt 1: saves PENDING → acquires lock → DB timeout during saga → @Retry triggers
+Attempt 2: findByIdempotencyKey → finds PENDING → returns PENDING immediately ← BUG
+```
+
+**The fix**
+
+The early-return guard checks `isTerminal()` before short-circuiting. `PENDING` and `PROCESSING` fall through so the retry can complete the saga:
+
+```java
+Optional<Transaction> existing = transactionRepository.findByIdempotencyKey(command.idempotencyKey());
+if (existing.isPresent() && existing.get().isTerminal()) {
+    return existing.get();  // only COMPLETED / FAILED / etc. return here
+}
+// PENDING or PROCESSING: fall through and re-run the saga
+```
+
+**Files**: `TransferMoneyService.java`
+
+---
+
+### Challenge 3 — Race Condition Between Idempotency Check and First Save
+
+**The problem**
+
+Two identical requests arrive simultaneously. Both call `findByIdempotencyKey` before either has saved, both find nothing, and both proceed to `transactionRepository.save()`. The second save violates the `UNIQUE` constraint on `idempotency_key`.
+
+```
+Thread A: findByIdempotencyKey → empty
+Thread B: findByIdempotencyKey → empty
+Thread A: save(PENDING) → OK
+Thread B: save(PENDING) → DataIntegrityViolationException ← duplicate key
+```
+
+**The fix**
+
+Three layers of defence work together:
+
+1. **Save before the lock** — intent is recorded as `PENDING` before lock acquisition. The DB `UNIQUE` constraint on `idempotency_key` is the definitive guard for concurrent duplicates; `JpaTransactionRepositoryAdapter` catches `DataIntegrityViolationException` and returns the existing record.
+2. **Re-read status inside the lock** — after acquiring the lock, the transaction's current status is re-read. If a concurrent duplicate already finished the saga, the status is terminal and the saga is skipped.
+3. **Re-use the existing record on retry** — if a non-terminal transaction already exists (e.g., from a prior interrupted attempt), it is reused rather than creating a new one.
+
+**Files**: `TransferMoneyService.java`, `JpaTransactionRepositoryAdapter.java`
+
+---
+
+### Challenge 4 — Non-Atomic Debit and Credit
+
+**The problem**
+
+Running debit and credit as two separate database transactions leaves a window of inconsistency:
+
+```
+DB transaction A:  UPDATE accounts SET balance = 600 WHERE id = alice  ← commits
+                   ← JVM crash, network failure, or any exception HERE
+DB transaction B:  UPDATE accounts SET balance = 400 WHERE id = bob    ← never runs
+```
+
+After a crash between the two commits, Alice has lost $400 and Bob has gained nothing. The old approach tried to fix this with application-level compensation (a third DB write to reverse the debit), but compensation can also fail — leading to a second inconsistency and a `NEEDS_MANUAL_REVIEW` state that still required human intervention.
+
+**The fix**
+
+Debit and credit are wrapped in a single `TransactionTemplate`, making them one atomic DB transaction:
+
+```java
+transactionTemplate.execute(status -> {
+    source.debit(amount);
+    accountRepository.save(source);   // ─┐ same DB transaction
+    target.credit(amount);            //  │
+    accountRepository.save(target);   // ─┘ commit or roll back together
+    return null;
+});
+```
+
+If anything throws inside the template, the database rolls back both saves automatically. There is no partial state, no compensation logic, and no `COMPENSATING`/`COMPENSATED` status needed. The only remaining edge case is Phase 3 (status save fails after the atomic commit) — at that point the balances are correct and the only repair needed is updating the status record.
+
+**Files**: `TransferSagaOrchestrator.java`, `TransactionConfig.java`
+
+---
+
+### Challenge 5 — Deadlock from Unordered Lock Acquisition
+
+**The problem**
+
+Two transfers share a common account and run concurrently on different threads or nodes:
+
+```
+Transfer A (Alice → Bob): tries to lock Alice, then Bob
+Transfer B (Bob → Alice): tries to lock Bob, then Alice
+```
+
+If A locks Alice and B locks Bob simultaneously, each waits for the other's lock indefinitely — a classic deadlock.
+
+**The fix**
+
+Lock IDs are sorted into a canonical order before acquisition. Every thread on every node acquires the same two locks in the same order, making the circular-wait condition impossible:
+
+```java
+List<UUID> lockOrder = List.of(command.fromAccountId(), command.toAccountId())
+    .stream().sorted().toList();
+distributedLock.executeWithLocks(lockOrder, () -> { ... });
+```
+
+**Files**: `TransferMoneyService.java`, `RedissonDistributedLock.java`
+
+---
+
+### Challenge 6 — JVM Crash Leaves Transfers Permanently Stuck in PROCESSING
+
+**The problem**
+
+If the JVM crashes after the saga marks a transaction `PROCESSING` but before the atomic debit+credit commits, the transaction row stays in `PROCESSING` forever. No retry is triggered because the process is dead. The idempotency check on the next request from the client will fall through (non-terminal), re-run the saga, and complete correctly — but only if the client retries. Requests that are never retried are permanently lost.
+
+**Current state**
+
+The `PROCESSING` status is persisted to the database immediately (Phase 1 of the saga) specifically as a crash-recovery signal. A monitoring query can detect rows stuck in `PROCESSING` beyond a threshold and alert operations:
+
+```sql
+SELECT id, created_at FROM transactions
+WHERE status = 'PROCESSING'
+  AND updated_at < NOW() - INTERVAL '5 minutes';
+```
+
+**Known gap**
+
+There is no automated recovery job in this implementation. A stuck `PROCESSING` row requires either a client retry or manual operator intervention. See [Known Limitations](#known-limitations--production-considerations).
+
+**Files**: `TransferSagaOrchestrator.java` (Phase 1 commit), `Transaction.java` (`markProcessing`)
 
 ---
 
