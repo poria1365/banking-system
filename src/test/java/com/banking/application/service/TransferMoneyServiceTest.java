@@ -57,8 +57,6 @@ class TransferMoneyServiceTest {
         var command = new TransferMoneyCommand("key-1", source.getId(), target.getId(),
             Money.of("250.00", "USD"));
 
-        // First findById is the re-read inside the lock (must be non-terminal so saga runs).
-        // Second findById is the final fetch after the lock is released.
         Transaction pendingTxn = Transaction.createTransfer("key-1", source.getId(), target.getId(),
             Money.of("250.00", "USD"));
         Transaction completedTxn = Transaction.createTransfer("key-1", source.getId(), target.getId(),
@@ -67,6 +65,10 @@ class TransferMoneyServiceTest {
         completedTxn.markCompleted();
 
         when(transactionRepository.findByIdempotencyKey("key-1")).thenReturn(Optional.empty());
+        // Pre-lock: existsById for fail-fast validation
+        when(accountRepository.existsById(source.getId())).thenReturn(true);
+        when(accountRepository.existsById(target.getId())).thenReturn(true);
+        // Inside lock: findById for fresh account loads
         when(accountRepository.findById(source.getId())).thenReturn(Optional.of(source));
         when(accountRepository.findById(target.getId())).thenReturn(Optional.of(target));
         when(transactionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
@@ -82,9 +84,6 @@ class TransferMoneyServiceTest {
 
     @Test
     void transfer_concurrentDuplicate_transactionAlreadyTerminalInsideLock_skipsSaga() {
-        // Two requests with the same idempotency key both pass the initial check before either saves.
-        // The second request gets the existing record back from the DB UNIQUE constraint handler,
-        // acquires the lock after the first finishes, and must not re-run the saga.
         var command = new TransferMoneyCommand("key-concurrent", source.getId(), target.getId(),
             Money.of("100.00", "USD"));
 
@@ -94,8 +93,8 @@ class TransferMoneyServiceTest {
         alreadyCompleted.markCompleted();
 
         when(transactionRepository.findByIdempotencyKey("key-concurrent")).thenReturn(Optional.empty());
-        when(accountRepository.findById(source.getId())).thenReturn(Optional.of(source));
-        when(accountRepository.findById(target.getId())).thenReturn(Optional.of(target));
+        when(accountRepository.existsById(source.getId())).thenReturn(true);
+        when(accountRepository.existsById(target.getId())).thenReturn(true);
         when(transactionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
         // Re-read inside lock finds COMPLETED — the concurrent duplicate already finished
         when(transactionRepository.findById(any())).thenReturn(Optional.of(alreadyCompleted));
@@ -125,13 +124,39 @@ class TransferMoneyServiceTest {
     }
 
     @Test
+    void transfer_nonTerminalExistingTransaction_retried_sagaRuns() {
+        // A PENDING transaction (e.g. from a prior interrupted attempt) is not terminal.
+        // The service must fall through and run the saga rather than returning the stale state.
+        Transaction pending = Transaction.createTransfer("key-retry", source.getId(), target.getId(),
+            Money.of("50.00", "USD"));
+        Transaction completed = Transaction.createTransfer("key-retry", source.getId(), target.getId(),
+            Money.of("50.00", "USD"));
+        completed.markProcessing();
+        completed.markCompleted();
+
+        when(transactionRepository.findByIdempotencyKey("key-retry")).thenReturn(Optional.of(pending));
+        when(accountRepository.existsById(source.getId())).thenReturn(true);
+        when(accountRepository.existsById(target.getId())).thenReturn(true);
+        when(accountRepository.findById(source.getId())).thenReturn(Optional.of(source));
+        when(accountRepository.findById(target.getId())).thenReturn(Optional.of(target));
+        when(transactionRepository.findById(any()))
+            .thenReturn(Optional.of(pending))    // inside lock: still non-terminal
+            .thenReturn(Optional.of(completed)); // final fetch
+
+        service.transfer(new TransferMoneyCommand("key-retry", source.getId(), target.getId(),
+            Money.of("50.00", "USD")));
+
+        verify(sagaOrchestrator).execute(eq(pending), any(), any(), any());
+    }
+
+    @Test
     void transfer_sourceAccountNotFound_throwsAccountNotFoundException() {
         UUID unknownId = UUID.randomUUID();
         var command = new TransferMoneyCommand("key-2", unknownId, target.getId(),
             Money.of("100.00", "USD"));
 
         when(transactionRepository.findByIdempotencyKey("key-2")).thenReturn(Optional.empty());
-        when(accountRepository.findById(unknownId)).thenReturn(Optional.empty());
+        when(accountRepository.existsById(unknownId)).thenReturn(false);
 
         assertThatExceptionOfType(AccountNotFoundException.class)
             .isThrownBy(() -> service.transfer(command))
@@ -147,8 +172,8 @@ class TransferMoneyServiceTest {
             Money.of("100.00", "USD"));
 
         when(transactionRepository.findByIdempotencyKey("key-3")).thenReturn(Optional.empty());
-        when(accountRepository.findById(source.getId())).thenReturn(Optional.of(source));
-        when(accountRepository.findById(unknownId)).thenReturn(Optional.empty());
+        when(accountRepository.existsById(source.getId())).thenReturn(true);
+        when(accountRepository.existsById(unknownId)).thenReturn(false);
 
         assertThatExceptionOfType(AccountNotFoundException.class)
             .isThrownBy(() -> service.transfer(command))
@@ -163,6 +188,8 @@ class TransferMoneyServiceTest {
             Money.of("50.00", "USD"));
 
         when(transactionRepository.findByIdempotencyKey("key-4")).thenReturn(Optional.empty());
+        when(accountRepository.existsById(source.getId())).thenReturn(true);
+        when(accountRepository.existsById(target.getId())).thenReturn(true);
         when(accountRepository.findById(source.getId())).thenReturn(Optional.of(source));
         when(accountRepository.findById(target.getId())).thenReturn(Optional.of(target));
         when(transactionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
@@ -173,7 +200,6 @@ class TransferMoneyServiceTest {
         service.transfer(command);
 
         verify(distributedLock).executeWithLocks(argThat(ids -> {
-            // IDs must be sorted
             List<UUID> sorted = List.of(source.getId(), target.getId()).stream().sorted().toList();
             return ids.equals(sorted);
         }), any(Runnable.class));
@@ -181,20 +207,21 @@ class TransferMoneyServiceTest {
 
     @Test
     void transfer_transactionSavedBeforeLocksAcquired() {
-        // Intent is recorded first so we can detect partial failures even if process crashes mid-saga
         var command = new TransferMoneyCommand("key-5", source.getId(), target.getId(),
             Money.of("75.00", "USD"));
 
         when(transactionRepository.findByIdempotencyKey("key-5")).thenReturn(Optional.empty());
+        when(accountRepository.existsById(source.getId())).thenReturn(true);
+        when(accountRepository.existsById(target.getId())).thenReturn(true);
         when(accountRepository.findById(source.getId())).thenReturn(Optional.of(source));
         when(accountRepository.findById(target.getId())).thenReturn(Optional.of(target));
-        when(transactionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
         Transaction dummy = Transaction.createTransfer("key-5", source.getId(), target.getId(), Money.of("75.00", "USD"));
         when(transactionRepository.findById(any())).thenReturn(Optional.of(dummy));
 
         var saveOrder = new java.util.concurrent.atomic.AtomicBoolean(false);
         doAnswer(inv -> {
-            saveOrder.set(true); // save called
+            saveOrder.set(true);
             return inv.getArgument(0);
         }).when(transactionRepository).save(any());
 

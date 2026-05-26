@@ -21,6 +21,8 @@
         <java.version>21</java.version>
         <resilience4j.version>2.2.0</resilience4j.version>
         <jjwt.version>0.12.5</jjwt.version>
+        <!-- 1.18.38+ required for Java 24 compatibility -->
+        <lombok.version>1.18.40</lombok.version>
     </properties>
 
     <dependencies>
@@ -156,6 +158,31 @@
 
     <build>
         <plugins>
+            <!-- Java 24 requires explicit opens for Mockito inline mocking and Byte Buddy instrumentation -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <argLine>
+                        -XX:+EnableDynamicAgentLoading
+                        --add-opens java.base/java.lang=ALL-UNNAMED
+                        --add-opens java.base/java.util=ALL-UNNAMED
+                    </argLine>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                            <version>${lombok.version}</version>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
